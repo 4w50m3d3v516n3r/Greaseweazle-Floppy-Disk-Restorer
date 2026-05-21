@@ -1,4 +1,4 @@
-# Floppy Disk Workbench
+# Greaseweazle Floppy Disk Workbench
 
 **Floppy Disk Analysis, Restoration & Recovery Tool**
 
