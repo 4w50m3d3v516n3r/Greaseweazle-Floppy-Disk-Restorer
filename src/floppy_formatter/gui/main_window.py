@@ -2193,6 +2193,16 @@ class MainWindow(QMainWindow):
 
     def _start_write_image_operation(self) -> None:
         """Start the write image operation with configuration dialog."""
+        # IMPORTANT: Stop RPM polling before touching the device. The drive-control
+        # panel's 500ms _rpm_timer polls try_get_rpm() -> Unit.read_track() on the
+        # GUI thread; if it keeps firing while the DiskImageWorker thread drives the
+        # same pyserial port, the two threads interleave bytes on the wire and the
+        # Greaseweazle command protocol desyncs permanently ("Command returned
+        # garbage"). Every other operation pauses it in _on_start_clicked; the
+        # write_image branch early-returns before that, so pause it here.
+        # Resumed by _on_operation_complete(), or the cancel paths below.
+        self._drive_control.pause_rpm_polling()
+
         # Show configuration dialog
         dialog = WriteImageConfigDialog(self)
         if dialog.exec() != dialog.DialogCode.Accepted:
@@ -2229,6 +2239,17 @@ class MainWindow(QMainWindow):
 
         # Update status
         self._status_strip.set_formatting(0, spec.total_tracks)
+
+        # Enter the WRITING_IMAGE state and light up the Progress tab. Every other
+        # operation does this in _on_start_clicked; write_image early-returns before
+        # that, so without this the UI stayed on "No Operation / Idle / 0%" for the
+        # whole write.
+        self._state = WorkbenchState.WRITING_IMAGE
+        self._operation_toolbar.start_operation()
+        self._analytics_panel.start_progress(
+            "write_image", spec.total_tracks, total_sectors
+        )
+        self._update_state()
 
         logger.info("Starting write image operation: %s", format_name)
 
@@ -2283,6 +2304,10 @@ class MainWindow(QMainWindow):
                 )
             self._sector_map_panel.update_scenes()
 
+            # Keep the Progress tab's position readout live.
+            self._analytics_panel.update_progress_track(cylinder, head)
+            self._status_strip.set_formatting(cylinder, spec.cylinders)
+
     def _on_image_track_verified(self, cylinder: int, head: int, verified: bool) -> None:
         """Handle track verified signal from disk image worker."""
         if not verified:
@@ -2334,10 +2359,12 @@ class MainWindow(QMainWindow):
     def _on_write_image_progress(self, progress: int) -> None:
         """Handle write image progress update."""
         self._operation_toolbar.set_progress(progress)
+        self._analytics_panel.update_progress(progress)
 
     def _on_write_image_status(self, status: str) -> None:
         """Handle write image status message."""
         self._status_strip.set_operation_status(status)
+        self._analytics_panel.update_progress_message(status)
 
     def _on_write_image_error(self, error: str) -> None:
         """Handle write image error."""
