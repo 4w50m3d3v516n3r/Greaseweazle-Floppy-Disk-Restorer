@@ -108,6 +108,26 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 
+def _analysis_track_rows(track_results, limit: int = 20) -> list:
+    """
+    Flatten ``DiskAnalysisResult.track_results`` into plain dicts for a report.
+
+    ``TrackAnalysisResult`` carries its grade/score on an optional ``quality``
+    (``TrackQuality``) sub-object, not as top-level attributes, and ``quality``
+    can be ``None`` for a track that failed to decode.
+    """
+    rows = []
+    for tr in (track_results or [])[:limit]:
+        quality = getattr(tr, "quality", None)
+        rows.append({
+            "cylinder": getattr(tr, "cylinder", None),
+            "head": getattr(tr, "head", None),
+            "quality_score": round(quality.score, 1) if quality is not None else 0.0,
+            "grade": str(quality.grade) if quality is not None else "?",
+        })
+    return rows
+
+
 class WorkbenchState(Enum):
     """Overall workbench state."""
     IDLE = auto()
@@ -878,20 +898,17 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            # Get device info from Greaseweazle Unit object
-            unit = getattr(self._device, '_unit', None)
-            if unit:
-                hw_model = getattr(unit, 'hw_model', 'Unknown')
-                fw_major = getattr(unit, 'major', '?')
-                fw_minor = getattr(unit, 'minor', '?')
-                firmware = f"V{hw_model} FW {fw_major}.{fw_minor}"
+            # Get device info from the GreaseweazleDevice wrapper
+            if self._device.is_connected():
+                fw = self._device.firmware_version
+                fw_str = f"{fw[0]}.{fw[1]}" if fw else "?"
+                firmware = f"{self._device.model_name} (FW {fw_str})"
 
-                # Get serial if available
-                serial = getattr(unit, 'serial', None)
-                if serial:
-                    serial_str = serial[:12] if len(serial) > 12 else serial
-                else:
-                    serial_str = "N/A"
+                # Serial number, if the underlying pyserial port exposes one
+                unit = getattr(self._device, '_unit', None)
+                port_info = getattr(unit, 'port_info', None)
+                serial = getattr(port_info, 'serial_number', None)
+                serial_str = (serial[:12] if serial else "N/A")
             else:
                 firmware = "Unknown"
                 serial_str = "N/A"
@@ -3436,8 +3453,8 @@ class MainWindow(QMainWindow):
                 "bad_sectors": len(result.bad_sectors),
                 "bad_sector_list": result.bad_sectors,
                 "good_sector_list": result.good_sectors,
-                "elapsed_ms": (
-                    int(result.elapsed_time * 1000) if hasattr(result, 'elapsed_time') else 0
+                "elapsed_ms": int(
+                    getattr(result, "scan_duration", getattr(result, "elapsed_time", 0)) * 1000
                 ),
                 "health_percentage": self._disk_health or 0,
             }
@@ -3596,15 +3613,7 @@ class MainWindow(QMainWindow):
                 "protection_types": result.protection_types,
                 "protected_track_count": result.protected_track_count,
                 "recommendations": result.recommendations,
-                "track_results": [
-                    {
-                        "cylinder": tr.cylinder,
-                        "head": tr.head,
-                        "quality_score": tr.quality_score,
-                        "grade": tr.grade,
-                    }
-                    for tr in result.track_results[:20]  # First 20 for summary
-                ] if result.track_results else [],
+                "track_results": _analysis_track_rows(result.track_results),
             }
 
             if result.overall_grade in ('A', 'B'):

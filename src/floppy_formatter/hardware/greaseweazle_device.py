@@ -36,12 +36,17 @@ try:
     # NOTE: We don't import usb_open or find_port from greaseweazle.tools.util
     # because they have a bug in list_ports_windows.py that crashes when any
     # device on the system has port_name=None. We use pyserial directly instead.
+    try:
+        from greaseweazle.usb import EARLIEST_SUPPORTED_FIRMWARE
+    except ImportError:  # older host-tools releases
+        EARLIEST_SUPPORTED_FIRMWARE = (0, 31)
     GREASEWEAZLE_AVAILABLE = True
 except ImportError:
     GREASEWEAZLE_AVAILABLE = False
     gw_usb = None
     BusType = None
     Flux = None
+    EARLIEST_SUPPORTED_FIRMWARE = (0, 31)
 
 from . import (
     IFloppyDevice,
@@ -55,7 +60,7 @@ from . import (
     DriveType,
     DriveInfo,
 )
-from .flux_io import FluxData
+from .flux_io import FluxData, DEFAULT_SAMPLE_FREQ
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +88,47 @@ DD_35_RPM_NOMINAL = 300.0
 MOTOR_SPINUP_TIME = 0.5  # seconds to wait for motor to reach speed
 SEEK_SETTLE_TIME = 0.015  # seconds to wait for head to settle (15ms)
 INDEX_TIMEOUT = 2.0  # seconds to wait for index pulse
+
+
+# =============================================================================
+# Hardware model identification
+# =============================================================================
+
+# (hw_model, hw_submodel) -> human name. Mirrors greaseweazle.tools.info.model_id
+# so a V4.1 board (hw_model=4, hw_submodel=2) is not just reported as "V4".
+GREASEWEAZLE_MODELS = {
+    1: {0: "F1", 1: "F1 Plus", 2: "F1 Plus (Unbuffered)"},
+    4: {0: "V4", 1: "V4 Slim", 2: "V4.1"},
+    7: {
+        0: "F7 v1",
+        1: "F7 Plus (Ant Goffart, v1)",
+        2: "F7 Lightning",
+        3: "F7 v2",
+        4: "F7 Plus (Ant Goffart, v2)",
+        5: "F7 Lightning Plus",
+        6: "F7 Slim",
+        7: 'F7 v3 "Thunderbolt"',
+    },
+    8: {0: "Adafruit Floppy Generic"},
+}
+
+# Firmware at/above this (major, minor) is known-good with this application.
+# Below EARLIEST_SUPPORTED_FIRMWARE the host tools themselves refuse to run.
+RECOMMENDED_FIRMWARE = (1, 6)
+
+
+def greaseweazle_model_name(hw_model: int, hw_submodel: int = 0) -> str:
+    """
+    Map a Greaseweazle (hw_model, hw_submodel) pair to a display name.
+
+    Falls back to ``Unknown (0xMMSS)`` for pairs not in the table (e.g. a board
+    revision newer than this release knows about).
+    """
+    try:
+        name = GREASEWEAZLE_MODELS[hw_model][hw_submodel]
+    except KeyError:
+        return f"Unknown (0x{hw_model:02X}{hw_submodel:02X})"
+    return name if hw_model == 8 else f"Greaseweazle {name}"
 
 
 class GreaseweazleDevice(IFloppyDevice):
@@ -131,6 +177,7 @@ class GreaseweazleDevice(IFloppyDevice):
         self._current_head: int = 0
         self._drive_info: Optional[DriveInfo] = None
         self._device_info: Optional[str] = None
+        self._firmware_warning: Optional[str] = None
 
         logger.debug("GreaseweazleDevice initialized (usb_path=%s, bus_type=%d)",
                     usb_path, bus_type)
@@ -169,6 +216,54 @@ class GreaseweazleDevice(IFloppyDevice):
             Bus type: 1=IBMPC, 2=Shugart
         """
         return self._bus_type
+
+    @property
+    def hw_model(self) -> Optional[int]:
+        """Greaseweazle hardware model id (e.g. 4 for the V4 family), or None."""
+        return getattr(self._unit, "hw_model", None)
+
+    @property
+    def hw_submodel(self) -> int:
+        """Greaseweazle hardware sub-model id (e.g. 2 for V4.1). 0 if unknown."""
+        return getattr(self._unit, "hw_submodel", 0) or 0
+
+    @property
+    def firmware_version(self) -> Optional[Tuple[int, int]]:
+        """Firmware (major, minor) tuple, or None if not connected."""
+        if self._unit is None:
+            return None
+        return (getattr(self._unit, "major", 0), getattr(self._unit, "minor", 0))
+
+    @property
+    def model_name(self) -> str:
+        """Human-readable model name, e.g. 'Greaseweazle V4.1'."""
+        model = self.hw_model
+        if model is None:
+            return "Greaseweazle (not connected)"
+        return greaseweazle_model_name(model, self.hw_submodel)
+
+    @property
+    def sample_freq(self) -> int:
+        """
+        Flux-timer sample frequency of the connected unit, in Hz.
+
+        Every timing value passed to/from the Greaseweazle is in these ticks.
+        Different boards report different rates, so callers that encode flux for
+        writing (or convert ticks to time) must use this rather than assume a
+        fixed 72 MHz. Falls back to the nominal rate when not connected.
+        """
+        freq = getattr(self._unit, "sample_freq", None)
+        return int(freq) if freq else DEFAULT_SAMPLE_FREQ
+
+    @property
+    def firmware_warning(self) -> Optional[str]:
+        """
+        A human-readable caution about the connected firmware, or None.
+
+        Set at connect() time; surfaced by the GUI so the user knows an
+        old firmware may misbehave even though we did not refuse to connect.
+        """
+        return self._firmware_warning
 
     def set_bus_type(self, bus_type: int) -> None:
         """
@@ -265,6 +360,10 @@ class GreaseweazleDevice(IFloppyDevice):
             self._usb_path = device_path
             logger.debug("Connected to device: %s", device_path)
 
+            # Reject a device that cannot run real commands, and note (without
+            # rejecting) firmware older than we recommend.
+            self._check_firmware()
+
             # Set bus type (configured during __init__ or via set_bus_type)
             # This must be done before any drive operations
             # Note: set_bus_type expects an integer, not the enum directly
@@ -280,7 +379,9 @@ class GreaseweazleDevice(IFloppyDevice):
             raise
         except Exception as e:
             logger.error("Failed to connect to Greaseweazle: %s", e)
-            self._unit = None
+            # Release the serial handle if the Unit was already opened, so a
+            # partial connect() does not leave the COM port locked.
+            self._close_unit()
             raise ConnectionError(
                 f"Failed to connect to Greaseweazle: {e}",
                 usb_path=self._usb_path
@@ -318,18 +419,62 @@ class GreaseweazleDevice(IFloppyDevice):
                 except GreaseweazleError as e:
                     logger.warning("Error deselecting drive during disconnect: %s", e)
 
-            # Close the serial connection (Unit stores it in self.ser)
-            if hasattr(self._unit, 'ser') and self._unit.ser:
-                self._unit.ser.close()
-            logger.info("Disconnected from Greaseweazle")
-
         except Exception as e:
             logger.error("Error during disconnect: %s", e)
         finally:
-            self._unit = None
+            # Always release the serial handle, whatever happened above. A
+            # leaked handle locks the COM port until the process exits and
+            # makes the next connect() fail with "Access is denied".
+            self._close_unit()
             self._selected_drive = None
             self._motor_running = False
             self._device_info = None
+            logger.info("Disconnected from Greaseweazle")
+
+    def _close_unit(self) -> None:
+        """
+        Detach and close the underlying greaseweazle Unit / serial port.
+
+        Safe to call when nothing is open. Best-effort: a failure to reset or
+        close is logged but never raised, and ``self._unit`` is always cleared.
+        """
+        unit, self._unit = self._unit, None
+        if unit is None:
+            return
+
+        ser = getattr(unit, 'ser', None)
+        if ser is None:
+            return
+
+        # Ask the firmware to clear its comms state (ClearComms baud toggle)
+        # so a subsequent session starts from a clean stream. reset() also
+        # re-opens the port, so we still close() afterwards.
+        try:
+            unit.reset()
+        except Exception as e:
+            logger.debug("Unit.reset() during close failed: %s", e)
+
+        try:
+            ser.close()
+        except Exception as e:
+            logger.warning("Failed to close serial port: %s", e)
+
+    def _resync(self) -> None:
+        """
+        Recover a desynchronised serial stream mid-session.
+
+        Runs the greaseweazle ClearComms handshake (``Unit.reset()``) and drains
+        any stale bytes. Use this on error-recovery paths before retrying a
+        command. Best-effort; never raises.
+        """
+        if self._unit is None:
+            return
+        try:
+            self._unit.reset()
+            logger.debug("Serial stream re-synchronised (ClearComms)")
+        except Exception as e:
+            logger.warning("Failed to re-synchronise serial stream: %s", e)
+        self._flush_serial()
 
     def is_connected(self) -> bool:
         """
@@ -347,17 +492,58 @@ class GreaseweazleDevice(IFloppyDevice):
                 "Not connected to Greaseweazle device. Call connect() first."
             )
 
+    def _check_firmware(self) -> None:
+        """
+        Validate the connected unit's firmware.
+
+        Raises ConnectionError if the Greaseweazle is in bootloader/update mode
+        or running firmware too old for the host tools to drive. Records a
+        non-fatal ``firmware_warning`` for firmware older than RECOMMENDED_FIRMWARE.
+        """
+        self._firmware_warning = None
+        unit = self._unit
+        if unit is None:
+            return
+
+        if getattr(unit, "update_mode", False):
+            raise ConnectionError(
+                "Greaseweazle is in bootloader/update mode. Exit update mode "
+                "(re-plug the device) and try again.",
+                usb_path=self._usb_path,
+            )
+
+        if getattr(unit, "update_needed", False):
+            earliest = ".".join(str(x) for x in EARLIEST_SUPPORTED_FIRMWARE)
+            raise ConnectionError(
+                f"Greaseweazle firmware {self._fw_str()} is too old for the "
+                f"installed host tools (need {earliest} or later). Update the "
+                "firmware with 'gw update'.",
+                usb_path=self._usb_path,
+            )
+
+        fw = self.firmware_version
+        if fw is not None and fw < RECOMMENDED_FIRMWARE:
+            recommended = ".".join(str(x) for x in RECOMMENDED_FIRMWARE)
+            self._firmware_warning = (
+                f"Greaseweazle firmware {self._fw_str()} is older than the "
+                f"recommended {recommended}; some operations may be unreliable. "
+                "Consider running 'gw update'."
+            )
+            logger.warning(self._firmware_warning)
+
+    def _fw_str(self) -> str:
+        fw = self.firmware_version
+        return f"{fw[0]}.{fw[1]}" if fw else "?"
+
     def _get_device_info_string(self) -> str:
         """Get a string describing the connected device."""
         if self._unit is None:
             return "Not connected"
 
         try:
-            # The Unit object has hw_model, major, minor as direct attributes
-            hw_model = getattr(self._unit, 'hw_model', 'Unknown')
-            fw_major = getattr(self._unit, 'major', '?')
-            fw_minor = getattr(self._unit, 'minor', '?')
-            return f"Greaseweazle V{hw_model} (FW: {fw_major}.{fw_minor})"
+            fw = self.firmware_version
+            fw_str = f"{fw[0]}.{fw[1]}" if fw else "?"
+            return f"{self.model_name} (FW: {fw_str})"
         except Exception:
             return "Greaseweazle (unknown model)"
 
@@ -389,6 +575,37 @@ class GreaseweazleDevice(IFloppyDevice):
             logger.warning("Error scanning for Greaseweazle: %s", e)
             return None
 
+    @staticmethod
+    def _open_serial(device_path: str):
+        """
+        Open the raw pyserial port for a Greaseweazle.
+
+        The Greaseweazle wire protocol (greaseweazle.usb.Unit) is written for
+        *blocking* reads: every ``_send_cmd()`` does ``ser.read(2)`` and waits
+        for the firmware acknowledgement, and flux reads stream until an
+        end-of-stream byte. A finite ``timeout`` here causes short reads on any
+        command that takes longer than the timeout to acknowledge (a long seek,
+        motor spin-up, flux status polling). A short read raises
+        ``struct.error`` ("unpack requires a buffer of 2 bytes") and, worse,
+        the ack bytes that arrive just after the timeout stay buffered and
+        offset every subsequent response by one byte -- the permanent
+        "Command returned garbage (00 != xx)" failure mode.
+
+        ``greaseweazle.tools.util.usb_open()`` opens the port with a bare
+        ``serial.Serial(devicename)`` (no timeout, no baud override), so we do
+        the same. Baud rate is meaningless on the Greaseweazle's USB-CDC ACM
+        interface.
+
+        Args:
+            device_path: COM port path (e.g., 'COM3')
+
+        Returns:
+            An open ``serial.Serial`` instance with blocking reads.
+        """
+        import serial
+
+        return serial.Serial(device_path)
+
     def _open_device_direct(self, device_path: str):
         """
         Open Greaseweazle device directly using pyserial.
@@ -408,10 +625,15 @@ class GreaseweazleDevice(IFloppyDevice):
         import serial
 
         try:
-            # Open serial port with standard Greaseweazle settings
-            ser = serial.Serial(device_path, baudrate=115200, timeout=1)
+            ser = self._open_serial(device_path)
+        except serial.SerialException as e:
+            raise ConnectionError(
+                f"Failed to open serial port {device_path}: {e}",
+                usb_path=device_path
+            ) from e
 
-            # Create Unit object directly
+        try:
+            # Create Unit object directly (this performs the firmware handshake)
             unit = gw_usb.Unit(ser)
 
             logger.debug(
@@ -421,12 +643,14 @@ class GreaseweazleDevice(IFloppyDevice):
 
             return unit
 
-        except serial.SerialException as e:
-            raise ConnectionError(
-                f"Failed to open serial port {device_path}: {e}",
-                usb_path=device_path
-            ) from e
         except Exception as e:
+            # The handshake failed after the port was opened. Release the OS
+            # handle now, otherwise the port stays locked and the next connect()
+            # attempt fails with "Access is denied".
+            try:
+                ser.close()
+            except Exception:
+                pass
             raise ConnectionError(
                 f"Failed to initialize Greaseweazle on {device_path}: {e}",
                 usb_path=device_path
@@ -624,9 +848,10 @@ class GreaseweazleDevice(IFloppyDevice):
 
         logger.info("Turning motor off for drive %d", self._selected_drive)
 
-        # If force mode, flush serial first to clear any pending operations
+        # If force mode, re-synchronise the stream first to clear any pending
+        # operations or a desynced link.
         if force:
-            self._flush_serial()
+            self._resync()
 
         max_attempts = 3 if force else 1
         last_error = None
@@ -644,8 +869,8 @@ class GreaseweazleDevice(IFloppyDevice):
                     attempt + 1, max_attempts, e
                 )
                 if force and attempt < max_attempts - 1:
-                    # Flush and retry
-                    self._flush_serial()
+                    # Re-synchronise and retry
+                    self._resync()
                     time.sleep(0.2)
 
         # All attempts failed
@@ -750,11 +975,33 @@ class GreaseweazleDevice(IFloppyDevice):
         except Exception as e:
             logger.error("Seek to C%d H%d failed: %s", cylinder, head, e)
             raise SeekError(
-                f"Seek failed: {e}",
+                self._describe_seek_failure(e),
                 target_cylinder=cylinder,
                 target_head=head,
                 device_info=self._device_info
             ) from e
+
+    def _describe_seek_failure(self, err: Exception) -> str:
+        """
+        Turn a raw greaseweazle seek error into an actionable message.
+
+        The firmware returns "Track 0 not found" whenever it steps the head to
+        cylinder 0 and the drive never asserts /TRK0 -- overwhelmingly because
+        nothing is responding on the selected drive unit (wrong unit number,
+        drive-select jumper, or ribbon cable), not an actual head-position
+        fault.
+        """
+        text = str(err)
+        if "Track 0 not found" in text or "Track0 signal" in text:
+            unit = self._selected_drive
+            other = 1 - unit if unit in (0, 1) else "the other unit"
+            return (
+                f"No drive responded on unit {unit}: the drive's TRACK 0 sensor "
+                f"never asserted. Check that a drive is connected and powered, "
+                f"then try drive unit {other}, and check the ribbon cable and the "
+                f"drive-select jumper. (firmware: {text})"
+            )
+        return f"Seek failed: {text}"
 
     def seek_track0(self) -> None:
         """
@@ -1222,6 +1469,9 @@ class GreaseweazleDevice(IFloppyDevice):
 
         except Exception as e:
             logger.error("Failed to reinitialize drive: %s", e)
+            # Leave the link in a clean state so a caller retry (or a later
+            # operation) does not inherit a desynced stream.
+            self._resync()
             raise GreaseweazleError(
                 f"Failed to reinitialize drive: {e}",
                 device_info=self._device_info

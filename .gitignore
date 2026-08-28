@@ -53,8 +53,8 @@ htmlcov/
 *.log
 floppy_formatter.log
 
-# Reports
-reports/
+# Reports (generated output only - NOT the src/floppy_formatter/reports package)
+/reports/
 *.json
 *.txt
 

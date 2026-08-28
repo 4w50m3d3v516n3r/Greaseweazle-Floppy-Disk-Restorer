@@ -232,6 +232,7 @@ class ReconstructedFlux:
     cylinder: int
     head: int
     source_captures: int
+    sample_rate: int = 72_000_000  # Hz; carried from the source captures
 
     def get_overall_confidence(self) -> float:
         """Get overall reconstruction confidence."""
@@ -255,8 +256,9 @@ class ReconstructedFlux:
         """
         from floppy_formatter.hardware import FluxData
 
-        # Convert microseconds back to sample counts
-        sample_rate = 72_000_000  # Standard Greaseweazle rate
+        # Convert microseconds back to sample counts, using the sample rate
+        # carried from the source captures.
+        sample_rate = self.sample_rate
         factor = sample_rate / 1_000_000
         flux_times = [int(t * factor) for t in self.flux_timings]
 
@@ -638,6 +640,7 @@ def reconstruct_from_captures(captures: AlignedCaptures) -> ReconstructedFlux:
         cylinder=captures.cylinder,
         head=captures.head,
         source_captures=captures.capture_count,
+        sample_rate=captures.sample_rate,
     )
 
 

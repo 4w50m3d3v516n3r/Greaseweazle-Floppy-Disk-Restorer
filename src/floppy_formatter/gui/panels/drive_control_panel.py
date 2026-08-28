@@ -39,6 +39,23 @@ from floppy_formatter.hardware import (
 logger = logging.getLogger(__name__)
 
 
+def _default_drive_index() -> int:
+    """
+    Drive unit to preselect in the combo.
+
+    Reads ``settings.device.default_drive_unit`` (which itself defaults to 0,
+    matching ``gw --drive=A`` and the standard twisted PC ribbon). Falls back to
+    0 on any error or out-of-range value.
+    """
+    try:
+        from floppy_formatter.core.settings import get_settings
+
+        unit = int(get_settings().device.default_drive_unit)
+    except Exception:
+        return 0
+    return unit if unit in (0, 1) else 0
+
+
 class ConnectionState(Enum):
     """Greaseweazle connection state."""
     DISCONNECTED = auto()
@@ -186,7 +203,13 @@ class DriveControlPanel(QWidget):
 
         self._drive_combo = QComboBox()
         self._drive_combo.addItems(["0", "1"])
-        self._drive_combo.setCurrentIndex(1)  # Default to Drive B (for straight cable + DS1 drive)
+        # Unit 0 (= gw --drive=A, the end connector of a twisted PC ribbon) is
+        # the right default for almost every setup; honour the user's setting.
+        self._drive_combo.setCurrentIndex(_default_drive_index())
+        self._drive_combo.setToolTip(
+            "Greaseweazle drive-select unit. Most drives answer on 0 "
+            "(gw --drive=A); use 1 only for a straight ribbon with a DS1 drive."
+        )
         self._drive_combo.setFixedWidth(50)
         self._drive_combo.currentIndexChanged.connect(self._on_drive_changed)
         main_layout.addWidget(self._drive_combo)

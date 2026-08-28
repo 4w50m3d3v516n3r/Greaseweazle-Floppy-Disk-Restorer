@@ -201,7 +201,9 @@ def degauss_track(
 
         # Create DC erase flux data - constant level (no transitions)
         # We write a very long interval representing "no transitions"
-        dc_erase_flux = _generate_dc_erase_flux(track_duration_us)
+        dc_erase_flux = _generate_dc_erase_flux(
+            track_duration_us, sample_rate=device.sample_freq
+        )
 
         # Perform the erase
         flux_writer.write_track(cyl, head, dc_erase_flux)
@@ -242,7 +244,10 @@ def degauss_track(
         )
 
 
-def _generate_dc_erase_flux(track_duration_us: float) -> bytes:
+def _generate_dc_erase_flux(
+    track_duration_us: float,
+    sample_rate: int = 72_000_000,
+) -> bytes:
     """
     Generate flux data for DC erase operation.
 
@@ -251,6 +256,9 @@ def _generate_dc_erase_flux(track_duration_us: float) -> bytes:
 
     Args:
         track_duration_us: Track duration in microseconds
+        sample_rate: Greaseweazle flux-timer sample rate in Hz. Pass the
+            connected unit's ``sample_freq`` (via ``device.sample_freq``);
+            the 72 MHz default is only a fallback.
 
     Returns:
         Flux data bytes for DC erase
@@ -259,8 +267,6 @@ def _generate_dc_erase_flux(track_duration_us: float) -> bytes:
     # Greaseweazle flux format: sequence of inter-flux intervals
     # We write one very long interval covering the entire track
 
-    # Convert to Greaseweazle sample rate (typically 72MHz = 72 ticks/μs)
-    sample_rate = 72_000_000  # 72 MHz
     ticks_per_us = sample_rate / 1_000_000
 
     total_ticks = int(track_duration_us * ticks_per_us)

@@ -535,7 +535,9 @@ def write_sector(device: GreaseweazleDevice, cylinder: int, head: int,
                     ))
 
         # Encode and write the track
-        flux_data = encode_sectors_to_flux(cylinder, head, sectors)
+        flux_data = encode_sectors_to_flux(
+            cylinder, head, sectors, sample_freq=device.sample_freq
+        )
         write_track_flux(device, cylinder, head, flux_data, erase_first=True)
 
         # Invalidate cache since track was modified
@@ -605,7 +607,9 @@ def write_track(device: GreaseweazleDevice, cylinder: int, head: int,
 
     try:
         # Encode and write
-        flux_data = encode_sectors_to_flux(cylinder, head, sectors)
+        flux_data = encode_sectors_to_flux(
+            cylinder, head, sectors, sample_freq=device.sample_freq
+        )
         write_track_flux(device, cylinder, head, flux_data, erase_first=True)
 
         # Invalidate cache
@@ -671,7 +675,9 @@ def write_track_pattern(device: GreaseweazleDevice, cylinder: int, head: int,
         )
 
         # Encode and write
-        flux_data = encode_sectors_to_flux(cylinder, head, sectors)
+        flux_data = encode_sectors_to_flux(
+            cylinder, head, sectors, sample_freq=device.sample_freq
+        )
         write_track_flux(device, cylinder, head, flux_data, erase_first=True)
 
         # Invalidate cache
@@ -738,7 +744,9 @@ def format_track_low_level(
         )
 
         # Encode and write
-        flux_data = encode_sectors_to_flux(cylinder, head, sectors)
+        flux_data = encode_sectors_to_flux(
+            cylinder, head, sectors, sample_freq=device.sample_freq
+        )
         write_track_flux(device, cylinder, head, flux_data, erase_first=False)
 
         # Invalidate cache
